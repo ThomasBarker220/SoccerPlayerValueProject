@@ -1,0 +1,764 @@
+---
+title: "Predicting Soccer Player Market Value"
+author: "Dav King, Luke Thomas, Thomas Barker, Harry Liu"
+format: pdf
+---
+
+```{r setup, include = F}
+knitr::opts_chunk$set(echo = F, message = F, warning = F, fig.show = 'hide')
+```
+
+```{r libraries and data}
+#| label: load-pkg-data
+#| warning: false
+library(tidyverse)
+library(tidymodels)
+library(lubridate)
+library(psych)
+library(Routliers)
+library(patchwork)
+library(corrplot)
+library(knitr)
+library(rms)
+
+players <- read_csv(here::here("data", "players.csv"))
+player_valuations <- read_csv(here::here("data", "player_valuations.csv"))
+appearances <- read_csv(here::here("data", "appearances.csv"))
+data <- players %>% 
+  full_join(player_valuations) %>% 
+  full_join(appearances)
+data <- data %>% 
+  filter(date >= '2018-08-01') %>% 
+  filter(date <= '2019-05-31')
+```
+
+```{r cleaning data}
+end_value <- data %>% 
+  group_by(player_id) %>% 
+  filter(!is.na(market_value_in_gbp)) %>%
+  slice(which.max(date)) %>% 
+  select(player_id, market_value_in_gbp) %>% 
+  rename(final_value = market_value_in_gbp)
+
+transData <- data %>% 
+  full_join(end_value) %>% 
+  group_by(player_id) %>%
+  mutate(total_goals = sum(goals, na.rm = T), total_assists = sum(assists, na.rm = T),
+         total_minutes = sum(minutes_played, na.rm = T), total_yellow = sum(yellow_cards, na.rm = T),
+         total_red = sum(red_cards, na.rm = T)) %>% 
+  slice(which.max(final_value)) %>% 
+  select(-c(game_id, appearance_id, competition_id, player_club_id, goals, assists, minutes_played, yellow_cards, red_cards, player_pretty_name, current_club_id, market_value_in_gbp, market_value, datetime, player_club_domestic_competition_id)) %>%
+  ungroup()
+
+transData <- transData %>% 
+  mutate(age_in_days = as.duration(date_of_birth %--% date) / ddays(1)) %>% 
+  filter(total_minutes > 0)
+```
+
+# Introduction and Data
+
+## Introduction and Research Question
+
+Every year, tens of thousands of soccer players are transferred on the international transfer market. Soccer clubs pay other clubs, sometimes hundreds of millions of pounds, to sign players to their team in hopes of improving club performance. These astronomical transfer prices are often determined by clubs with the help of Transfermarkt, a popular online soccer database that uses data scouts to collect data from the match sheets of soccer games. Our goal with this research is to take a deeper look into Transfermarkt's valuations of soccer players around the globe. Specifically, we are asking: how can we use a player's individual characteristics (nationality, age, position, etc.) and performance (goals, assists, minutes, yellow cards, etc.) to predict their market value? We predict that factors like being younger, playing as a forward, having more goals and assists, and playing more minutes will all contribute positively/increase a player's market value.
+
+## Data Description
+
+There are several different datasets present in the overall data (players, player_valuations, appearances). As mentioned in the introduction, these data were collected by Transfermarkt's data scouts who look at the match sheets of soccer games and collect statistics like these. In the players dataset, each observation is a player and contains information such as their name, player id, country of citizenship, position, and date of birth. In the player valuations dataset, each observation is a market value of a player, and also includes the player id and date of the valuation. In the appearances dataset, each observation is a player's appearance in a soccer game, and it also includes the player id, number of goals scored in that appearance, number of assists in that appearance, number of minutes played in that appearance, and the number of yellow and/or red cards obtained in that appearance. 
+
+These data sets have been combined such that each observation is a player and contains their final market value. We conducted data cleaning, which includes dropping a number of repetitive or irrelevant variables generated during the join (these includes game_id, datetime, appearance_id, etc), and filtering the dataset to only include those players who played at least one minute in the 2018-2019 season. Variables, including total_goals, total_assists, total_minutes, and total_yellow are created by grouping by player_id and summing the the goals, assists, minutes_played, and yellow_cards for each player respectively. These summed-up number are the variables we are using for building the model and they represent the total number of goals, assists contributed by each player, their total time (in minutes) played, and the total number of yellow cards received, all exclusively during the 2018-2019 season. After these numbers being summed for each player, we dropped the original variables including goals, assists, minutes_played, and yellow_cards. Additionally, we created the age_in_days variable to represent how old the player is - this is produced by subtracting their birth date from the date that their final valuation was recorded in the 2018-2019 season. Together from these transformations, after aggregating the data together, it is ensured that there is exactly one observation for each player. Additionally electing to include for analysis only for the 2018-2019 season allows us to derive more meaningful predictions from our dataset and eliminate the effects of time-related co-founding variables such as inflation and age. After the data cleaning, we are left with N = `r count(transData) %>% pull()` players to include in our analysis.
+
+Data Citation: 
+Cariboo, David. *Football Data from Transfermarkt.* (data file). Kaggle, 2022. Web. 03 Nov 2022. https://www.kaggle.com/datasets/davidcariboo/player-scores
+
+## Exploratory Data Analysis
+
+### Distribution of Response Variable: End-of-Season Market Value
+
+```{r Distribution of Response, fig.show = 'asis'}
+p1 <- ggplot(transData, aes(x = final_value)) +
+  geom_histogram(color = "white") +
+  theme_bw() +
+  labs(x = "Market Value in GBP", y = "Number of Athletes",
+       title = "Player Market Values") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_x_continuous(labels = label_number_si())
+
+p2 <- ggplot(transData, aes(x = log(final_value))) +
+  geom_histogram(color = "white") +
+  theme_bw() +
+  labs(x = "Log of Market Value in GBP", y = "Number of Athletes",
+       title = "Player Market Values") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p1 + p2
+```
+
+Our initial look at the univariate distribution of player market values shows a unimodal and extremely right-skewed distribution, with a range from 9,000 to 135,000,000 pounds and a median at 293000 pounds (Q1 = 180000, Q3 = 720000). This is clearly a non-normal distribution, and it may well be better considered a logarithmic distribution instead.
+
+If we log-transform the response variable, however, it roughly follows a normal distribution. It is unimodal, with a center around 12.5 and minimal skew. It ranges from 9.1 to 18.72 and has a median at 12.59 (Q1 = 12.1, Q3 = 13.49). While we will not necessarily run our regression using the log of our response variable, this is still important to note.
+
+#### Distribution of Key Predictors Variables: On-Field Performance
+
+Other key predictors that will be considered are the stats for each player's on-field performance, frequently referred to in this report as their "statistics". Given that the distributions of goals, assists, and minutes played are heavily right-skewed, and any observations greater than 0 were considered outliers, we elected to present the graphs only when the values were present (i.e., greater than 0); however, we have considered the data both with and without these values. The first plot shows us the total goals scored by players with more than zero, which shows a unimodal but incredibly right-skewed distribution, centered around 2 with a range from 1 to 51. The median is 2 (Q1 = 1, Q3 = 5), with a mean at 3.83 (sd = 4.36). The second plot shows us the total assists by players with more than zero, which shows a unimodal but still right-skewed distribution, again centered around 2 with a range from 1 to 23. The median is 2 (Q1 = 1, Q3 = 4), with a mean at 2.94 (sd = 2.7). The third plot shows us the total minutes played by players with more than zero, which shows a unimodal and right-skewed (but less so) distribution, with a mode around 250 and a range from 1 to 4913. The median is 1168.5 (Q1 = 348, Q3 = 2141), with a mean at 1338.91 (sd = 1066.15). The final plot shows us the total number of yellow cards that players received, which shows a unimodal and right-skewed distribution, with a range from 0 to 23, a median of 2 (Q1 = 1, Q3 = 5), and a mean of 3.03.
+
+```{r Performance, fig.show = 'asis'}
+goals <- ggplot(transData, aes(x = total_goals)) +
+  geom_histogram(color = "white") +
+  theme_bw() +
+  labs(x = "Total Goals", y = "Number of Players", 
+       title = "Goals 18-19") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+goalsTrans <- transData %>% 
+  filter(total_goals > 0) %>% 
+  ggplot(aes(x = total_goals)) +
+  geom_histogram(color = "white") +
+  theme_bw() +
+  labs(x = "Total Number of Goals Scored", y = "Number of Players", 
+       title = "Distribution of Goals Scored during the 2018-2019 Season",
+       subtitle = "excluding players who scored 0 goals") +
+  theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5))
+
+goalsTrans2 <- transData %>% 
+  filter(total_goals > 0) %>% 
+  ggplot(aes(x = log(total_goals))) +
+  geom_histogram(color = "white") +
+  theme_bw() +
+  labs(x = "Log of Total Number of Goals Scored", y = "Number of Players", 
+       title = "Distribution of Goals Scored during the 2018-2019 Season") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+goals2 <- transData %>% 
+  filter(total_goals > 0) %>% 
+  ggplot(aes(x = total_goals)) +
+  geom_histogram(color = "white") +
+  theme_bw() +
+  labs(x = "Total Goals", y = "Number of Players", 
+       title = "Goals 18-19") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+assists <- ggplot(transData, aes(x = total_assists)) + 
+  geom_histogram(color = "white") +
+  theme_bw() +
+  labs(x = "Total Assists", y = "Number of Players", title = "Assists 18-19") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+assists2 <- transData %>% 
+  filter(total_assists > 0) %>% 
+  ggplot(aes(x = total_assists)) + 
+  geom_histogram(color = "white", binwidth = 1) +
+  theme_bw() +
+  labs(x = "Total Assists", y = "Number of Players", title = "Assists 18-19") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+minutes <- ggplot(transData, aes(x = total_minutes)) +
+  geom_histogram(color = "white") +
+  theme_bw() +
+  labs(x = "Total Minutes", y = "Number of Players", title = "Minutes 18-19") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+minutes2 <- transData %>% 
+  filter(total_minutes > 0) %>% 
+  ggplot(aes(x = total_minutes)) +
+  geom_histogram(color = "white") +
+  theme_bw() +
+  labs(x = "Total Minutes", y = "Number of Players", title = "Minutes 18-19") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+yellow <- ggplot(transData, aes(x = total_yellow)) +
+  geom_histogram(color = "white", binwidth = 1) +
+  theme_bw() +
+  labs(x = "Total Yellow Cards", y = "Number of Players", title = "Yellow Cards 18-19") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+(goals2 + assists2) / (minutes2 + yellow)
+
+```
+
+### Numeric Predictor and Response Relationships
+
+The plot below shows the correlations between our key numeric predictor variables and our response variable of final market value. The most noticeable correlation coefficients are between a player's total minutes played, and their total goals, assists, and yellow cards, producing values of 0.55, 0.64, and 0.78 respectively. These each indicate a moderately strong correlation, which logically makes sense, since a player who plays more minutes would expect to accumulate more stats. Another noticeable value is the moderately strong correlation of 0.67 between a player's total goals and total assists, since these stats are both accumulated more by attacking players and less by defensive players. From this information, it may be interesting to explore the potential interaction effect between a player's position and their total goals and assists, since attackers are expected to have more goals and assists than defenders. Lastly, there does not appear to be strong correlations between age or final market value and any of the other numeric predictors.
+
+```{r corrplot, fig.show = 'asis'}
+
+transData |>
+  select(total_goals, total_assists, total_minutes, total_yellow, age_in_days, final_value) %>%
+  cor(.) %>% # we make the correlations, only on complete.obs
+  round(., 2) %>%  # this just rounds up the numbers, we can remove it
+  corrplot::corrplot(., method="number", number.cex = 0.7)
+```
+
+# Methodology
+
+```{r First Model}
+set.seed(111)
+dataSplit <- initial_split(transData)
+soccerTrain <- training(dataSplit)
+soccerTest <- testing(dataSplit)
+folds <- vfold_cv(soccerTrain, v = 10)
+
+unTransModel <- recipe(final_value ~ pretty_name + country_of_citizenship + position + age_in_days + 
+                         total_goals + total_assists + total_minutes + total_yellow, soccerTrain) %>% 
+  update_role(pretty_name, new_role = "ID") %>% 
+  step_other(country_of_citizenship) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_center(all_numeric_predictors()) %>% 
+  step_zv(all_predictors())
+
+spec <- linear_reg() %>% 
+  set_engine("lm")
+
+unTransWflow <- workflow() %>% 
+  add_model(spec) %>% 
+  add_recipe(unTransModel)
+
+unTransFit <- unTransWflow %>% 
+  fit(soccerTrain)
+
+unTransExtract <- extract_fit_parsnip(unTransFit)
+unTransAug <- augment(unTransExtract$fit)
+
+ggplot(unTransAug, aes(x = .fitted, y = .resid)) +
+  geom_point()
+
+# We'll just stop there and start with models that might actually meet our assumptions
+```
+
+```{r logModel}
+#As of right now, we might want to use this one
+logModel <- recipe(final_value ~ pretty_name + country_of_citizenship + position + age_in_days + 
+                         total_goals + total_assists + total_minutes + total_yellow + height_in_cm, soccerTrain) %>% 
+  update_role(pretty_name, new_role = "ID") %>% 
+  step_log(final_value) %>% 
+  step_other(country_of_citizenship) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_center(all_numeric_predictors()) %>% 
+  step_zv(all_predictors())
+
+logWflow <- workflow() %>% 
+  add_model(spec) %>% 
+  add_recipe(logModel)
+
+logFit <- logWflow %>% 
+  fit(soccerTrain)
+
+logExtract <- extract_fit_parsnip(logFit)
+logAug <- augment(logExtract$fit)
+
+ggplot(logAug, aes(x = .fitted, y = .resid)) +
+  geom_point()
+
+scatter.smooth(soccerTrain$age_in_days, log(soccerTrain$final_value))
+plot(lm(log(final_value) ~ age_in_days, soccerTrain))
+
+
+
+
+scatter.smooth(soccerTrain$total_goals, log(soccerTrain$final_value))
+plot(lm(log(final_value) ~ total_goals, soccerTrain))
+
+
+
+
+scatter.smooth(soccerTrain$total_assists, log(soccerTrain$final_value))
+plot(lm(log(final_value) ~ total_assists, soccerTrain))
+
+
+
+
+```
+
+```{r second logModel}
+logModel2 <- recipe(final_value ~ pretty_name + country_of_citizenship + position + age_in_days + 
+                         total_goals + total_assists + total_minutes + total_yellow + height_in_cm, soccerTrain) %>% 
+  update_role(pretty_name, new_role = "ID") %>% 
+  step_log(final_value, total_goals, total_assists, total_minutes, total_yellow) %>% 
+  step_other(country_of_citizenship) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_center(all_numeric_predictors()) %>% 
+  step_zv(all_predictors())
+
+logWflow2 <- workflow() %>% 
+  add_model(spec) %>% 
+  add_recipe(logModel2)
+
+logFit2 <- logWflow2 %>% 
+  fit(soccerTrain)
+
+logExtract2 <- extract_fit_parsnip(logFit2)
+logAug2 <- augment(logExtract2$fit)
+
+ggplot(logAug2, aes(x = .fitted, y = .resid)) +
+  geom_point()
+```
+
+```{r logSig model}
+sigModel <- recipe(final_value ~ pretty_name + country_of_citizenship + age_in_days + total_goals + total_assists
+                   + total_minutes + height_in_cm, soccerTrain) %>% 
+  update_role(pretty_name, new_role = "ID") %>% 
+  step_log(final_value) %>% 
+  step_other(country_of_citizenship) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_center(all_numeric_predictors()) %>% 
+  step_zv(all_predictors())
+
+sigWflow <- workflow() %>% 
+  add_model(spec) %>% 
+  add_recipe(sigModel)
+
+sigFit <- sigWflow %>% 
+  fit(soccerTrain)
+
+sigExtract <- extract_fit_parsnip(sigFit)
+sigAug <- augment(sigExtract$fit)
+
+ggplot(sigAug, aes(x = .fitted, y = .resid)) +
+  geom_point()
+```
+
+```{r just player stats}
+statsModel <- recipe(final_value ~ pretty_name + total_goals + total_assists + total_minutes,
+                     soccerTrain) %>% 
+  update_role(pretty_name, new_role = "ID") %>% 
+  step_log(final_value) %>% 
+  step_center(all_numeric_predictors()) %>% 
+  step_zv(all_predictors())
+
+statsWflow <- workflow() %>% 
+  add_model(spec) %>% 
+  add_recipe(statsModel)
+
+statsFit <- statsWflow %>% 
+  fit(soccerTrain)
+
+statsExtract <- extract_fit_parsnip(statsFit)
+statsAug <- augment(statsExtract$fit)
+
+ggplot(statsAug, aes(x = .fitted, y = .resid)) +
+  geom_point()
+```
+
+```{r no player stats}
+noStatsModel <- recipe(final_value ~ pretty_name + country_of_citizenship + country_of_birth +
+                         age_in_days + position + height_in_cm, soccerTrain) %>% 
+  update_role(pretty_name, new_role = "ID") %>% 
+  step_log(final_value) %>% 
+  step_other(country_of_citizenship, country_of_birth) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_center(all_numeric_predictors()) %>% 
+  step_zv(all_predictors())
+
+noStatsWflow <- workflow() %>% 
+  add_model(spec) %>% 
+  add_recipe(noStatsModel)
+
+noStatsFit <- noStatsWflow %>% 
+  fit(soccerTrain)
+
+noStatsExtract <- extract_fit_parsnip(noStatsFit)
+noStatsAug <- augment(noStatsExtract$fit)
+
+ggplot(noStatsAug, aes(x = .fitted, y = .resid)) +
+  geom_point()
+```
+
+```{r interact goals assists minutes with position}
+interactModel <- recipe(final_value ~ pretty_name + country_of_citizenship + age_in_days + height_in_cm +
+                          total_goals + total_assists + total_minutes + total_yellow + position, soccerTrain) %>% 
+  update_role(pretty_name, new_role = "ID") %>% 
+  step_log(final_value) %>% 
+  step_other(country_of_citizenship) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_center(all_numeric_predictors()) %>% 
+  step_interact(terms = ~ starts_with("position"):starts_with("total_")) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_zv(all_predictors())
+
+interactWflow <- workflow() %>% 
+  add_model(spec) %>% 
+  add_recipe(interactModel)
+
+interactFit <- interactWflow %>% 
+  fit(soccerTrain)
+
+interactExtract <- extract_fit_parsnip(interactFit)
+interactAug <- augment(interactExtract$fit)
+
+ggplot(noStatsAug, aes(x = .fitted, y = .resid)) +
+  geom_point()
+```
+
+Our goal in this analysis was to select the best possible model for predicting a player's market value on the basis of their individual characteristics. In order to capture variability in market value, we elected to employ a multiple linear regression framework. Over the process of selecting a model, we considered seven different multiple regression models, all of which predicted a player's final value. While the first model predicted market value directly, due to extreme issues in the assumptions required to run multiple linear regression, the other six models predicted the log of market value (see Appendix for more information). The models considered a number of different predictors, including country of citizenship and birth, position, age, height, total goals, assists, yellow cards, and minutes. Additionally, the final model explored whether predictions of market value could be improved when considering potential differences in how individual player statistics predicted market value based on the position that they played.
+
+All seven models were developed within the same framework, predicting market value (or its logarithm) with a multiple linear regression and briefly testing model assumptions and conditions. The first model (`unTransModel`) predicted market value directly from our predictors of interest (except for country of birth, which was only used in the `noStatsModel`). The second model (`logModel`) did the same, except it predicted the logarithm of market value instead. The third model (`logModel2`) was the same as `logModel`, except that it also log-transformed the predictors of minutes, goals, assists, and yellow cards, all of which were shown to have serious right-skew. The fourth model (`sigModel`) took only the predictors from `logModel` that were statistically significant in order to predict the log of market value. The fifth model (`statsModel`) used only player on-field statistics to predict the log of market value, while the sixth (`noStatsModel`) used all other predictors. Finally, the seventh model (`interactModel`) used all predictors from `logModel`, as well as considering the interaction between position and all individual player statistics.
+
+For all models, we mean-centered numeric predictors, dummy-coded categorical predictors and collapsed them down to meaningful levels, and removed all zero-variance predictors. In order to select the optimally performing model, ten-fold cross validation was performed on all models using the same folds, which were a random subset of 80% of the data set aside for training the models. This allowed us to be certain that we calculated more robust $R^2$, RMSE, AIC, and BIC values for all models, as well as identified the model that was most adept at making predictions on new data. The results from that model can be seen in the table below.
+
+```{r finding best model}
+#Prediction: RMSE and BIC
+
+calc_model_stats <- function(x) {
+  glance(extract_fit_parsnip(x)) |>
+    select(adj.r.squared, AIC, BIC)
+}
+
+set.seed(55)
+unTransResamples <- unTransWflow |>
+  fit_resamples(resamples = folds, 
+                control = control_resamples(extract = calc_model_stats))
+
+logResamples <- logWflow |>
+  fit_resamples(resamples = folds, 
+                control = control_resamples(extract = calc_model_stats))
+
+logResamples2 <- logWflow2 |>
+  fit_resamples(resamples = folds, 
+                control = control_resamples(extract = calc_model_stats))
+
+sigResamples <- sigWflow |>
+  fit_resamples(resamples = folds, 
+                control = control_resamples(extract = calc_model_stats))
+
+statsResamples <- statsWflow |>
+  fit_resamples(resamples = folds, 
+                control = control_resamples(extract = calc_model_stats))
+
+noStatsResamples <- noStatsWflow |>
+  fit_resamples(resamples = folds, 
+                control = control_resamples(extract = calc_model_stats))
+
+interactResamples <- interactWflow |>
+  fit_resamples(resamples = folds, 
+                control = control_resamples(extract = calc_model_stats))
+
+comparisonMetrics <- tibble(model = character(), rmse = numeric(), adjRsq = numeric(),
+                            AIC = numeric(), BIC = numeric())
+comparisonMetrics <- comparisonMetrics %>% 
+  add_row(model = "unTransModel",
+          rmse = collect_metrics(unTransResamples) %>% filter(.metric == "rmse") %>% select(mean) %>% pull(),
+          adjRsq = map_df(unTransResamples$.extracts, ~ .x[[1]][[1]]) %>% summarise(a = mean(adj.r.squared)) %>%
+            select(a) %>% pull(),
+          AIC = map_df(unTransResamples$.extracts, ~ .x[[1]][[1]]) %>% summarise(a = mean(AIC)) %>%
+            select(a) %>% pull(),
+          BIC = map_df(unTransResamples$.extracts, ~ .x[[1]][[1]]) %>% summarise(a = mean(BIC)) %>%
+            select(a) %>% pull()) %>% 
+  add_row(model = "logModel",
+          rmse = collect_metrics(logResamples) %>% filter(.metric == "rmse") %>% select(mean) %>% pull(),
+          adjRsq = map_df(logResamples$.extracts, ~ .x[[1]][[1]]) %>% summarise(a = mean(adj.r.squared)) %>%
+            select(a) %>% pull(),
+          AIC = map_df(logResamples$.extracts, ~ .x[[1]][[1]]) %>% summarise(a = mean(AIC)) %>%
+            select(a) %>% pull(),
+          BIC = map_df(logResamples$.extracts, ~ .x[[1]][[1]]) %>% summarise(a = mean(BIC)) %>%
+            select(a) %>% pull()) %>% 
+  add_row(model = "logModel2",
+          rmse = collect_metrics(logResamples2) %>% filter(.metric == "rmse") %>% select(mean) %>% pull(),
+          adjRsq = map_df(logResamples2$.extracts, ~ .x[[1]][[1]]) %>% summarise(a = mean(adj.r.squared)) %>%
+            select(a) %>% pull(),
+          AIC = map_df(logResamples2$.extracts, ~ .x[[1]][[1]]) %>% summarise(a = mean(AIC)) %>%
+            select(a) %>% pull(),
+          BIC = map_df(logResamples2$.extracts, ~ .x[[1]][[1]]) %>% summarise(a = mean(BIC)) %>%
+            select(a) %>% pull()) %>% 
+  add_row(model = "sigModel",
+          rmse = collect_metrics(sigResamples) %>% filter(.metric == "rmse") %>% select(mean) %>% pull(),
+          adjRsq = map_df(sigResamples$.extracts, ~ .x[[1]][[1]]) %>% summarise(a = mean(adj.r.squared)) %>%
+            select(a) %>% pull(),
+          AIC = map_df(sigResamples$.extracts, ~ .x[[1]][[1]]) %>% summarise(a = mean(AIC)) %>%
+            select(a) %>% pull(),
+          BIC = map_df(sigResamples$.extracts, ~ .x[[1]][[1]]) %>% summarise(a = mean(BIC)) %>%
+            select(a) %>% pull()) %>% 
+  add_row(model = "statsModel",
+          rmse = collect_metrics(statsResamples) %>% filter(.metric == "rmse") %>% select(mean) %>% pull(),
+          adjRsq = map_df(statsResamples$.extracts, ~ .x[[1]][[1]]) %>% summarise(a = mean(adj.r.squared)) %>%
+            select(a) %>% pull(),
+          AIC = map_df(statsResamples$.extracts, ~ .x[[1]][[1]]) %>% summarise(a = mean(AIC)) %>%
+            select(a) %>% pull(),
+          BIC = map_df(statsResamples$.extracts, ~ .x[[1]][[1]]) %>% summarise(a = mean(BIC)) %>%
+            select(a) %>% pull()) %>% 
+  add_row(model = "noStatsModel",
+          rmse = collect_metrics(noStatsResamples) %>% filter(.metric == "rmse") %>% select(mean) %>% pull(),
+          adjRsq = map_df(noStatsResamples$.extracts, ~ .x[[1]][[1]]) %>% summarise(a = mean(adj.r.squared)) %>%
+            select(a) %>% pull(),
+          AIC = map_df(noStatsResamples$.extracts, ~ .x[[1]][[1]]) %>% summarise(a = mean(AIC)) %>%
+            select(a) %>% pull(),
+          BIC = map_df(noStatsResamples$.extracts, ~ .x[[1]][[1]]) %>% summarise(a = mean(BIC)) %>%
+            select(a) %>% pull()) %>% 
+  add_row(model = "interactModel",
+          rmse = collect_metrics(interactResamples) %>% filter(.metric == "rmse") %>% select(mean) %>% pull(),
+          adjRsq = map_df(interactResamples$.extracts, ~ .x[[1]][[1]]) %>% summarise(a = mean(adj.r.squared)) %>%
+            select(a) %>% pull(),
+          AIC = map_df(interactResamples$.extracts, ~ .x[[1]][[1]]) %>% summarise(a = mean(AIC)) %>%
+            select(a) %>% pull(),
+          BIC = map_df(interactResamples$.extracts, ~ .x[[1]][[1]]) %>% summarise(a = mean(BIC)) %>%
+            select(a) %>% pull())
+
+kable(comparisonMetrics, digits = 3, col.names = c("Model", "RMSE", "Adj. R Sq.", "AIC", "BIC"))
+#Based on this, we want to use logModel - lowest RMSE (tie), lowest BIC overall, second lowest AIC and second 
+#highest adjusted r squared
+```
+
+Our cross validated metrics allow us to select between models. The first thing that is evident from the table is that `unTransModel` has very different statistics from the other models, as it is the only model to directly predict market value instead of its logarithmic transformation. However, as noted above and explained in appendix 1, models that did not log-transform market value saw extreme violations of the constant variance assumption required for linear regression. Thus, we will not consider that model for selection. With it eliminated, the other six models all predicted the logarithm of market value, and so their performance metrics can be compared directly without any variable transformations.
+
+Because our goal of this process is to develop the optimal model for *predicting* a player's market value, we will focus primarily on the metrics of RMSE and BIC. RMSE, which is a measure of the average error within a model (and thus a value that should be minimized) and is the most important value to consider for prediction, identified two models that were best for selection: `logModel` and `interactModel`, which both had the same RMSE scores down to at least the third decimal place. Between these, `logModel` had the better BIC score of 12874.53. Among the six models, it also had the second-best AIC score and was tied for the best adjusted $R^2$ score, meaning that it also performed well in terms of explanation. Thus, this is the model that we will use to predict a player's market value going forward.
+
+Before settling on the model, we needed to evaluate its conditions for linear regression. The first condition is independence. This dataset is full of players who are different from one another. There is no reason to suspect that any of our predictors except for possibly minutes have anything to do with one another, as they do not have maximum values and there is no reason to suspect that one player can tell us anything about another player. Additionally, market values are also independent from one another, as there is no salary cap in this soccer league and teams have proven very willing to pay extensively for players. Thus, the independence condition is met. The second condition, linearity, is also met. As seen in the plots shown in appendix 2.1, none of the predictors appear to have relationships with the residuals that are non-linear. The third condition is normality, which can be seen in appendix 2.2. The residuals seem to be distributed approximately normally; further, as we have many more than 30 observations, the CLT allows us to say that the normality condition is met regardless. The final condition is constant variance, which can be seen in the residuals vs. fitted plot in appendix 1. Unfortunately, there do seem to be some issues with constant variance in this plot. In order to check whether our conclusions were statistically sound in light of this, we simulated this model on 2,000 bootstrap samples of our data. This output can be found in appendix 3. Because all of our model's values were consistent with the findings of the bootstrapped model, we are confident in our model's validity despite the violation of constant variance. Additionally, VIF values for all of our variables were well below 10, which gives us confidence that we do not have any issues with multicollinearity in our model; these can be seen in Appendix 2.3.
+
+```{r VIF Values, eval = F}
+vif(unTransExtract$fit)
+
+#For our First Model, there does not appear to be concerning issues related to multicollinearity. The VIF for all variables are below 5. This indicates that no two variables are strongly correlated.
+
+vif(logExtract$fit)
+
+#For our logModel, there does not appear to be concerning issues related to multicollinearity. The VIF for all variables are below 5. This indicates that no two variables are strongly correlated.
+
+vif(logExtract2$fit)
+
+#For our Second logModel, there does not appear to be concerning issues related to multicollinearity. The VIF for all variables are below 5. This indicates that no two variables are strongly correlated.
+
+vif(sigExtract$fit)
+
+#For our sigModel, there does not appear to be concerning issues related to multicollinearity. The VIF for all variables are below 5. This indicates that no two variables are strongly correlated.
+
+vif(statsExtract$fit)
+
+#For our statsModel, there does not appear to be concerning issues related to multicollinearity. The VIF for all variables are below 5. This indicates that no two variables are strongly correlated.
+
+vif(noStatsExtract$fit)
+
+#For our noStatsModel, there does appear to be concerning issues related to multicollinearity. The VIF for a number of variables are above 10. This indicates that some variables are strongly correlated. We won't suggest that this model is usable before reducing multicollinearity.
+
+#Lastly, for our interactModel, VIF wouldn't make sense beacuse it has interaction terms.
+```
+
+# Results
+
+```{r final-model}
+finalModel <- logWflow %>% 
+  fit(data = soccerTrain)
+
+tidy(finalModel, conf.int = T, conf.level = 0.95) %>% 
+  kable(digits = 5) %>%
+  kableExtra::kable_styling(latex_options="scale_down") %>%
+  kableExtra::kable_styling(latex_options="HOLD_position")
+```
+
+```{r means}
+# soccerTrain |>
+#   summarise(mean_age_in_days = mean(age_in_days),
+#          mean_goals = mean(total_goals),
+#          mean_assists = mean(total_assists),
+#          mean_minutes = mean(total_minutes),
+#          mean_yellow = mean(total_yellow),
+#          mean_height = mean(height_in_cm))
+# 
+# exp(13.724487)
+
+age_days <- -0.000487
+
+effect_years <- (exp(age_days))^365.2422
+
+defender_effect <- exp(-0.028928)
+
+gk_effect <- exp(0.003299)
+
+mid_effect <- exp(0.117770)
+
+
+goals_effect <- exp(0.060201)
+
+assists_effect <- exp(0.067103)
+
+minutes_effect <- exp(0.000615)
+```
+
+$\hat{final\_value} = e^{13.7} \times e^{0.00049 \times age\_in\_days} \times e^{0.0602 \times total\_goals} \times e^{0.0671 \times total\_assists} \times e^{0.00062 \times total\_minutes} \times e^{-0.00787 \times total\_yellow} \times e^{0.00988 \times height\_in\_cm} \times e^{0.35308 \times citizenship\_France} \times e^{0.45405 \times citizenship\_Spain} \times e^{-0.21465 \times citizenship\_Other} \times e^{-0.02893 \times position\_Defender} \times e^{0.00323 \times position\_Goalkeeper} \times e^{0.11777 \times position\_Midfield}$
+
+Each of these slopes/effects will help us assess the hypothesis we made about our research questions, which was that being younger, playing as a forward, having more goals and assists, and playing more minutes will all contribute positively/increase a player's expected market value. We found, interestingly, that playing a position besides an attacker (midfielder, goalkeeper) actually contributed more positively to a player's expected market value than being an attacker, holding all else constant. However, upon further thought this makes sense, as a midfielder is likely more valuable than an attacker with the exact same number of goals and assists. The rest of the attributes in our hypothesis (more goals, being younger, more assists, more minutes), did indeed contribute positively to a player's expected market value. Specifically, a player\'s market value was impacted by these key statistics/attributes in the following ways. Significant relationships were found for age, total goals, total assists, and minutes played, in which for each additional one year increase in age, total goal scored, total assist made, and minute played the median market value of a player is expected to multiply by a factor of 0.83705, 1.0621, 1.0694, and 1.000615, respectively, on average, all else held constant. Among the effects of positions, only the effect of playing as a midfielder was significant, by which the market value of a midfielder is expected to be 1.1250 times that of an attacker, on average, all else constant. The effect of the positions of defender and goalkeeper after controlling for our other variables, however, were not significant, as their p-values were 0.574 and 0.968, respectively.
+
+```{r testing-data}
+#Had to log transform final_value on training and testing data for this step because predicting on the testing data wasn't working
+
+soccerTrain <- soccerTrain |>
+  mutate(log_final_value = log(final_value))
+
+soccerTest <- soccerTest |>
+  mutate(log_final_value = log(final_value))
+
+
+logModel <- recipe(log_final_value ~ pretty_name + country_of_citizenship + position + age_in_days + 
+                         total_goals + total_assists + total_minutes + total_yellow + height_in_cm, soccerTrain) %>% 
+  update_role(pretty_name, new_role = "ID") %>% 
+  step_other(country_of_citizenship) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_center(all_numeric_predictors()) %>% 
+  step_zv(all_predictors())
+
+logWflow <- workflow() %>% 
+  add_model(spec) %>% 
+  add_recipe(logModel)
+
+logFit <- logWflow %>% 
+  fit(soccerTrain)
+
+finalModel <- logWflow %>% 
+  fit(data = soccerTrain)
+
+final_test_pred <- predict(finalModel, soccerTest) |>
+  bind_cols(soccerTest)
+```
+
+```{r rmse-rsquared-testing, eval = F}
+rsq(final_test_pred, truth = log_final_value, estimate = .pred)
+rmse(final_test_pred, truth = log_final_value, estimate = .pred)
+```
+
+In order to evaluate our model, we then tested it on the remaining 20% of our data set aside for testing. The $R^2$ value when the model is applied to testing data is 0.391, which is only 0.02 less than the $R^2$ of the model when applied to the testing data, which is 0.411. Additionally, the rmse of the model when applied to the testing data is 1.264, which is not much higher than the rmse of the model when applied to the training data, which is 1.213. These small differences indicate that our model performs nearly just as well as it did on the data it was trained on. In light of this, we believe that our model is well-fit, but not over-fit, for the prediction of soccer player market value.
+
+# Discussion and Conclusion
+
+In the international soccer transfer market, soccer clubs often pay millions of pounds to sign promising players to their team. However, tens of thousands of players are transferred each year, making it impossible for coaches or scouts to evaluate them all. It is desirable for a club to identify players that they could sign for less than their true market value or sell for more than their true market value, so a successful predictive model for a player's market value would hold great power and practicality among the professional soccer community. In this project, we identified potentially significant and logical predictors, such as a player's age, position, nationality, height, total goals, total assists, total yellow cards, and total minutes played in the 2018-19 season, and used them to predict a player's market value at the end of the season.
+
+In our final selected model, we found that total goals, assists, and minutes played all contributed to a positive increase in player market value, all backed by a p-value of less than 0.05 to justify significance. This supports our hypothesis and makes logical sense in the context of the data, since players with more statistical contributions would expect to demand a higher value. Additionally, we found that increased age significantly contributes to lower market value, since younger players are generally valued more highly. Interestingly, we found that greater height significantly contributes to greater player market value, suggesting that tall players are more desirable. We also found that players from popular nations (Brazil, France, and Spain) valued significantly higher, on average, than players from other nations, potentially suggesting that those nations produce more good soccer players. Lastly, we found that midfielders are valued significantly higher than forwards, on average, while the other positions, as well as number of yellow cards, were not significant predictors in our model.
+
+Using this information, soccer clubs can have a better idea of what contributes positively and negatively to a player's market value in the international transfer market. While the TransferMarkt data for this analysis is quite reliable, there are some limitations that should be addressed. All statistics for on-field performance (goals, assists, minutes, etc.) are very right-skewed, with most observations having 0, and many attempts were made to make these variables suitable for a regression model, such as log-transforming. Having 0 on-field statistics does not necessarily indicate that someone should have a market value of 0, however it can be difficult to predict their market value from other categorical predictors alone. Acknowledging that variables are skewed, we conducted testing of seven different models and found that a multiple linear regression with log-transformed response was the most appropriate. Another major drawback is that this model failed to meet some of the required statistical assumptions, which limits the validity of our findings, although it was consistent with the results of running the model on bootstrapped samples. One idea for future work include conducting analysis and prediction across multiple seasons, rather than just one season, to get a better understanding of the player's whole career, and avoid potentially inaccurate predictions due to injury or other effects during the 2018-19 season. Additionally, more predictors could be included in the model, such as which league a player plays in or which club they play for.
+
+# Appendix
+
+## Appendix 1: Reasoning for Log-Transformed Response Variable
+
+```{r log-transformed resid fitted plots, fig.show = 'asis'}
+unTransRF <- ggplot(unTransAug, aes(x = .fitted, y = .resid)) +
+  geom_point() +
+  theme_bw() +
+  scale_x_continuous(labels = label_number(suffix = "M", scale = 1e-6)) +
+  scale_y_continuous(labels = label_number(suffix = "M", scale = 1e-6)) +
+  labs(x = "Fitted Values", y = "Residuals",
+       title = "Untransformed Response", subtitle = "Residuals vs Fitted") +
+  theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5))
+transRF <- ggplot(logAug, aes(x = .fitted, y = .resid)) +
+  geom_point() +
+  theme_bw() +
+  labs(x = "Fitted Values", y = "Residuals",
+       title = "Log-Transformed Response", subtitle = "Residuals vs Fitted") +
+  theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5))
+unTransRF + transRF
+```
+
+These two plots show the residuals vs fitted for `unTransModel` (left) and `logModel` (right). The first plot very clearly shows a trend in the residuals that violates constant variance for an untransformed response of market value. The second plot shows the same plot for `logModel`, which is the exact same model except that market value was log-transformed. Although there are still clear trends in this plot that make this model less than ideal, as mentioned above, it still comes so much closer to meeting the assumption of constant variance that we can remove from consideration all models which do not predict the log of market value.
+
+## Appendix 2: Assumptions
+
+### Appendix 2.1: Linearity
+
+```{r Linearity, fig.show = 'asis'}
+goalsPlot <- ggplot(logAug, aes(x = total_goals + mean(soccerTrain$total_goals), y = .resid)) +
+  geom_point() +
+  theme_bw() +
+  labs(x = "Total Goals", y = "Residuals", title = "Total Goals") +
+  theme(plot.title = element_text(hjust = 0.5))
+assistsPlot <- ggplot(logAug, aes(x = total_assists + mean(soccerTrain$total_assists), y = .resid)) +
+  geom_point() +
+  theme_bw() +
+  labs(x = "Total Assists", y = "Residuals", title = "Total Assists") +
+  theme(plot.title = element_text(hjust = 0.5))
+minutesPlot <- ggplot(logAug, aes(x = total_minutes + mean(soccerTrain$total_minutes), y = .resid)) +
+  geom_point() +
+  theme_bw() +
+  labs(x = "Total Minutes", y = "Residuals", title = "Total Minutes") +
+  theme(plot.title = element_text(hjust = 0.5))
+yellowPlot <- ggplot(logAug, aes(x = total_yellow + mean(soccerTrain$total_yellow), y = .resid)) +
+  geom_point() +
+  theme_bw() +
+  labs(x = "Total Yellow", y = "Residuals", title = "Total Yellow") +
+  theme(plot.title = element_text(hjust = 0.5))
+agePlot <- ggplot(logAug, aes(x = age_in_days + mean(soccerTrain$age_in_days), y = .resid)) +
+  geom_point() +
+  theme_bw() +
+  labs(x = "Age in Days", y = "Residuals", title = "Age in Days") +
+  theme(plot.title = element_text(hjust = 0.5))
+heightPlot <- logAug %>% 
+  filter(height_in_cm > 0) %>% 
+  ggplot(aes(x = height_in_cm + mean(soccerTrain$age_in_days), y = .resid)) +
+  geom_point() +
+  theme_bw() +
+  labs(x = "Height in CM", y = "Residuals", title = "Height in CM") +
+  theme(plot.title = element_text(hjust = 0.5))
+countryPlot <- logAug %>% 
+  mutate(country = case_when(country_of_citizenship_France > 0 ~ "France",
+                             country_of_citizenship_other > 0 ~ "Other",
+                             country_of_citizenship_Spain > 0 ~ "Spain",
+                             T ~ "Brazil")) %>% 
+  ggplot(aes(x = country, y = .resid)) +
+  geom_point() +
+  theme_bw() +
+  labs(x = "Country of Citizenship", y = "Residuals",
+       title = "Country of Citizenship") +
+  theme(plot.title = element_text(hjust = 0.5))
+positionPlot <- logAug %>% 
+  mutate(pos = case_when(position_Defender > 0 ~ "Defender",
+                         position_Midfield > 0 ~ "Midfield",
+                         position_Goalkeeper > 0 ~ "Goalkeeper",
+                         T ~ "Forward")) %>% 
+  ggplot(aes(x = pos, y = .resid)) +
+  geom_point() +
+  theme_bw() +
+  labs(x = "Position", y = "Residuals", title = "Position") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+goalsPlot + assistsPlot
+minutesPlot + yellowPlot
+agePlot + heightPlot
+countryPlot + positionPlot
+```
+
+### Appendix 2.2: Normality
+
+```{r Normality, fig.show = 'asis'}
+residHist <- ggplot(logAug, aes(x = .resid)) +
+  geom_histogram() +
+  theme_bw() +
+  labs(x = "Residuals", y = "Count", title = "Normality of Residuals") +
+  theme(plot.title = element_text(hjust = 0.5))
+residBox <- ggplot(logAug, aes(x = .resid)) +
+  geom_boxplot() +
+  theme_bw() +
+  labs(x = "Residuals")
+residHist / residBox
+```
+
+### Appendix 2.3: VIF Values
+
+```{r VIF Appendix}
+vif(logExtract$fit)
+```
+
+## Appendix 3: Bootstrapped Model
+
+```{r bootstrapping CIs}
+#set.seed(363)
+#boots <- bootstraps(soccerTrain, times = 2000, apparent = T)
+
+#fit_boots <- function(split){
+  #logWflow %>% fit(data = analysis(split))
+#}
+
+#DO NOT RUN
+#bootModels <- boots %>% 
+  #mutate(model = map(splits, fit_boots),
+         #coef_info = map(model, tidy))
+#save(bootModels, file = "bootModels.Rdata")
+#percentiles <- int_pctl(bootModels, coef_info)
+#save(percentiles, "percentiles.Rdata")
+
+#As a note to the graders: all of this code was run exactly in order to create the
+#"percentiles.Rdata" object loaded below. However, as it creates a fairly complex
+#model on 2000 bootstrapped samples, it took over an hour to run. Thus, we elected
+#to simply save the object and load it here, rather than run the code repeatedly.
+#Uncommenting this code and running it will recreate the "percentiles.Rdata" object
+#identically.
+
+load("data/percentiles.Rdata")
+kable(percentiles, digits = 5) %>%
+  kableExtra::kable_styling(latex_options="scale_down") %>%
+  kableExtra::kable_styling(latex_options="HOLD_position")
+```

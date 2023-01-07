@@ -1,0 +1,64 @@
+---
+title: "Topic ideas"
+author: "Stats is 'Fun': Dav King, Thomas Barker, Luke Thomas, Harry Liu"
+date: "`r Sys.Date()`"
+format: pdf
+execute: 
+  message: false
+  warning: false
+---
+
+```{r load-packages}
+library(tidyverse) 
+# load other packages as needed
+```
+
+```{r load-data}
+# load all data sets 
+players <- read_csv('data/players.csv')
+player_values <- read_csv('data/player_valuations.csv')
+appearances <- read_csv('data/appearances.csv')
+lifeExp <- read_csv("data/Life Expectancy Data.csv")
+```
+
+# Data Set 1 (soccer)
+
+## Introduction and Data
+
+<https://www.kaggle.com/datasets/davidcariboo/player-scores>
+
+These data sets from Kaggle include soccer player and game data updated regularly from Transfermarkt, a popular online soccer database that uses data scouts to collect data from the match sheets of soccer games. Observations about players include name, age, nationality, height, position, club, preferred foot, and market value, among others. Observations from specific games include each player's contributions such as minutes played, goals, assists, yellow cards, and red cards.
+
+## Research questions
+
+How can we use a player's individual characteristics (nationality, age, height, club, etc.) and performance (goals, assists, minutes, red cards, etc.) to predict their market value?
+
+## Glimpse of data
+
+```{r glimpse-data-1}
+# glimpse data set 1
+glimpse(players)
+glimpse(player_values)
+glimpse(appearances)
+```
+
+\pagebreak
+
+# Data Set 2
+
+## Introduction and Data
+
+<https://www.kaggle.com/datasets/kumarajarshi/life-expectancy-who?resource=download>
+
+This data set from Kaggle includes a number of variables that will allow us to predict life expectancy. These data were collected by the World Health Organization's Global Health Observatory from 2000-2015. The WHO tracks a number of different variables related to health using their own methodologies, which are optimized for comparability across country and time; thus, while these data may not entirely agree with the data published by individual countries, they are good comparisons with one another. The data include information on the life expectancy during various years in various countries, as well as a number of other potential predictors like adult mortality rate, BMI, infant deaths, alcohol consumption, and more.
+
+## Research questions
+
+How much of the variance in life expectancy can be explained by development status, life expectancy, adult mortality, infant deaths, alcohol consumption, GDP & GDP expenditure on healthcare, BMI, education, and population?
+
+## Glimpse of data
+
+```{r glimpse-data-2}
+glimpse(lifeExp)
+```
+

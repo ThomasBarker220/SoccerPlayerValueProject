@@ -1,0 +1,374 @@
+---
+title: "Proposal"
+author: "Stats is 'Fun' - Dav King, Luke Thomas, Thomas Barker, Harry Liu"
+format: pdf
+editor: visual
+---
+
+```{r setup, include = F}
+knitr::opts_chunk$set(echo = F, message = F, warning = F)
+```
+
+```{r libraries and data}
+#| label: load-pkg-data
+#| warning: false
+library(tidyverse)
+library(tidymodels)
+library(lubridate)
+library(psych)
+library(Routliers)
+library(patchwork)
+library(corrplot)
+
+players <- read_csv(here::here("data", "players.csv"))
+player_valuations <- read_csv(here::here("data", "player_valuations.csv"))
+appearances <- read_csv(here::here("data", "appearances.csv"))
+data <- players %>% 
+  full_join(player_valuations) %>% 
+  full_join(appearances)
+data <- data %>% 
+  filter(date >= '2018-08-01') %>% 
+  filter(date <= '2019-05-31')
+```
+
+```{r cleaning data}
+end_value <- data %>% 
+  group_by(player_id) %>% 
+  filter(!is.na(market_value_in_gbp)) %>%
+  slice(which.max(date)) %>% 
+  select(player_id, market_value_in_gbp) %>% 
+  rename(final_value = market_value_in_gbp)
+
+transData <- data %>% 
+  full_join(end_value) %>% 
+  group_by(player_id) %>%
+  mutate(total_goals = sum(goals, na.rm = T), total_assists = sum(assists, na.rm = T),
+         total_minutes = sum(minutes_played, na.rm = T), total_yellow = sum(yellow_cards, na.rm = T),
+         total_red = sum(red_cards, na.rm = T)) %>% 
+  slice(which.max(final_value)) %>% 
+  select(-c(game_id, appearance_id, competition_id, player_club_id, goals, assists, minutes_played, yellow_cards, red_cards, player_pretty_name, current_club_id, market_value_in_gbp, market_value, datetime, player_club_domestic_competition_id)) %>%
+  ungroup()
+```
+
+## Introduction
+
+Every year, tens of thousands of soccer players are transferred on the international transfer market. Soccer clubs pay other clubs, sometimes hundreds of millions of dollars, to sign players to their team in hopes of improving club performance. These astronomical transfer prices are often determined by clubs with the help of Transfermarkt, a popular online soccer database that uses data scouts to collect data from the match sheets of soccer games. Our goal with this research is to take a deeper look into Transfermarkt's valuations of soccer players around the globe. Specifically, we are asking: how can we use a player's individual characteristics (nationality, age, position, etc.) and performance (goals, assists, minutes, red cards, etc.) to predict their market value? We predict that factors like being younger, playing as a forward, having more goals and assists, and playing more minutes will all contribute positively/increase a player's market value.
+
+## Data description
+
+There are several different datasets present in the overall data. In the players dataset, each observation is a player and contains information such as their name, player id, country of citizenship, position, and date of birth. In the player valuations dataset, each observation is a market value of a player (of which there can be multiple for one player over time), and also includes the player id and date of the valuation. In the appearances dataset, each observation is a player's appearance in a soccer game, and it also includes the player id, number of goals scored in that appearance, number of assists in that appearance, number of minutes played in that appearance, and the number of yellow and/or red cards obtained in that appearance. As mentioned in the introduction, these data were collected by Transfermarkt's data scouts who look at the match sheets of soccer games and collect statistics like these.
+
+## Exploratory data analysis
+
+### Distribution of Response Variable: End-of-Season Market Value
+
+```{r Distribution of Response}
+p1 <- ggplot(transData, aes(x = final_value)) +
+  geom_histogram(color = "white") +
+  theme_bw() +
+  labs(x = "Market Value in GBP", y = "Number of Athletes",
+       title = "Player Market Values") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_x_continuous(labels = label_number_si())
+
+p2 <- ggplot(transData, aes(x = log(final_value))) +
+  geom_histogram(color = "white") +
+  theme_bw() +
+  labs(x = "Log of Market Value in GBP", y = "Number of Athletes",
+       title = "Player Market Values") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p1 + p2
+```
+
+```{r Response Descriptives, eval = F}
+describe(transData$final_value, quant = c(.25, .75))
+
+outliers_mad(transData$final_value)
+
+describe(log(transData$final_value), quant = c(.25, .75))
+
+outliers_mad(log(transData$final_value))
+```
+
+Our initial look at the univariate distribution of player market values shows a unimodal and extremely right-skewed distribution, with a range from \$9000 to \$135000000 and a peak close to \$0. They have a median at \$293000 (Q1 = \$180000, Q3 = \$720000) but a mean of \$1155740 (sd = \$3837886), which is well beyond the third quartile of the data. In fact, using the Median Absolute Deviation (Median +/- 3MAD) definition of outliers, this means that the mean, as well as all players with a market value above \$1093604, are considered outliers. The skew of 12.45 and the Kurtosi value of 262.36 both confirm what is clearly seen in the plot - this is clearly a non-normal distribution, and it may well be better considered a logarithmic distribution instead.
+
+If we log-transform the response variable, however, it roughly follows a normal distribution. It is unimodal, with a center around 12.5 and minimal skew. It has a median at 12.59 (Q1 = 12.1, Q3 = 13.49), which is very close to the mean of 12.79 (sd = 1.33). It ranges from 9.1 to 18.72, and its skew and Kurtosi values suggest that it is not significantly different from normal. Using the very robust Median +/- 3MAD definition of outliers, it still has 231 outliers (28 below a log value of 9.183, 203 above a log value of 15.993) among its 8599 observations, but this is much closer to a normal distribution than the untransformed variable. While we will not necessarily run our regression using the log of our response variable, this is still important to note.
+
+\pagebreak
+
+```{r Distribution of Response With Filters, eval = F}
+transData %>% 
+  filter(final_value <= 25000000) %>% 
+  ggplot(aes(x = final_value)) +
+  geom_histogram(color = "white") +
+  theme_bw() +
+  labs(x = "Market Value at End of Season, in GBP", y = "Number of Athletes",
+       title = "Distribution of Player Market Values",
+       subtitle = "Among Players with a MV of $25 Million or Less") +
+  theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5)) +
+  scale_x_continuous(labels = dollar_format())
+
+transData %>% 
+  filter(final_value <= 1093604) %>% 
+  ggplot(aes(x = final_value)) +
+  geom_histogram(color = "white") +
+  theme_bw() +
+  labs(x = "Market Value at End of Season, in GBP", y = "Number of Athletes",
+       title = "Distribution of Player Market Values", subtitle = "Excluding Outliers") +
+  theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5)) +
+  scale_x_continuous(labels = dollar_format())
+```
+
+### Distribution of Potential Predictor Variables
+
+#### Nationality
+
+```{r Nationality}
+birth <- transData %>% 
+  filter(!is.na(country_of_birth)) %>% 
+  group_by(country_of_birth) %>% 
+  summarize(n = n()) %>% 
+  arrange(desc(n)) %>% 
+  head(30) %>% 
+  ggplot(aes(x = reorder(country_of_birth, n), y = n)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  labs(x = "Country of Birth", y = "Number of Players",
+       title = "30 Most Common Birth Countries of Soccer Players") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+cit <- transData %>% 
+  filter(!is.na(country_of_citizenship)) %>% 
+  group_by(country_of_citizenship) %>% 
+  summarize(n = n()) %>% 
+  arrange(desc(n)) %>% 
+  head(15) %>% 
+  ggplot(aes(x = reorder(country_of_citizenship, n), y = n)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  labs(x = "Country of Citizenship", y = "Number of Players",
+       title = "Most Common\nCitizenships") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+diffCit <- transData %>% 
+  filter(!is.na(country_of_birth)) %>% 
+  filter(!is.na(country_of_citizenship)) %>% 
+  filter(country_of_birth != country_of_citizenship) %>% 
+  group_by(country_of_citizenship) %>% 
+  summarize(n = n()) %>% 
+  arrange(desc(n)) %>% 
+  head(15) %>% 
+  ggplot(aes(x = reorder(country_of_citizenship, n), y = n)) +
+  geom_col() +
+  coord_flip() + 
+  theme_bw() +
+  labs(x = "Current Country of Citizenship", y = "Number of Players",
+       title = "Most Common\nCitizenships",
+       subtitle = "of players born in\na different country") +
+  theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5))
+
+cit + diffCit
+```
+
+The first predictor variable to look at here is the nationality of different soccer players. The first graph shows us the 15 most common of the `r length(unique(transData$country_of_birth))` countries in which players in this dataset were born. We see a big dominance in European players, with Spain (`r transData %>% filter(country_of_birth == "Spain") %>% nrow()`), France (`r transData %>% filter(country_of_birth == "France") %>% nrow()`), Italy (`r transData %>% filter(country_of_birth == "Italy") %>% nrow()`), Germany (`r transData %>% filter(country_of_birth == "Germany") %>% nrow()`), and Brazil (`r transData %>% filter(country_of_birth == "Brazil") %>% nrow()`) making up the top 5 most common of these countries. The second graph shows us the 30 most common of the `r transData %>% filter(country_of_birth != country_of_citizenship) %>% group_by(country_of_citizenship) %>% n_groups()` countries in which players who were not born there hold citizenship. This graph reveals a large number of players who were likely born in the USSR, with Russia (`r transData %>% filter(country_of_birth != country_of_citizenship) %>% filter(country_of_citizenship == "Russia") %>% nrow()`), Serbia (`r transData %>% filter(country_of_birth != country_of_citizenship) %>% filter(country_of_citizenship == "Serbia") %>% nrow()`), Ukraine (`r transData %>% filter(country_of_birth != country_of_citizenship) %>% filter(country_of_citizenship == "Ukraine") %>% nrow()`), Turkey (`r transData %>% filter(country_of_birth != country_of_citizenship) %>% filter(country_of_citizenship == "Turkey") %>% nrow()`), and Morocco (`r transData %>% filter(country_of_birth != country_of_citizenship) %>% filter(country_of_citizenship == "Morocco") %>% nrow()`) serving as the most common countries on that list. This could be interesting to consider where players are moving to, and whether that has any impact on their market value. As a note, in order for nationality to be relevant in our analysis, we will need to collapse it down to a much smaller number of countries.
+
+\pagebreak
+
+#### Age
+
+```{r Age Dist, fig.width=4,fig.height=2}
+transData <- transData %>% 
+  mutate(age_in_days = as.duration(date_of_birth %--% date) / ddays(1))
+
+transData %>% 
+  ggplot(aes(x = age_in_days)) +
+  #Scale is not super informative, want to see if I can figure out how to transform it
+  geom_histogram(color = "white") +
+  theme_bw() +
+  labs(x = "Age in Days", y = "Number of Players", title = "Distribution of Player Ages") + 
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r Age Descriptives, eval = F}
+transData %>% 
+  {describe(.$age_in_days, quant = c(.25, .75))}
+
+transData %>% 
+  {outliers_mad(.$age_in_days)}
+```
+
+The next predictor to look at is a player's age. Looking at the histogram, it appears to be mostly normally distributed with a slight right-skew, unimodal, with a center around 9000 days (\~24.6 years) and a range from 5486 days (\~15 years) to 15346 days (\~42 years). The data have a median at 9246 days (\~25.3 days, Q1 = 8030 days/\~22 years, Q3 = 10515.25 days/\~29.1 years), with a mean at 9405.33 days (\~25.7 years, sd = 1687.5 days / \~4.6 years). The skew (0.38) and Kurtosi (-0.56) values do not suggest that the data are significantly non-normally distributed. Using the robust Median +/- 3MAD defnition of outliers, only 4 players are outliers (those above 14892.982 days / \~40.8 years).
+
+#### Position
+
+```{r Position}
+pos <- transData %>% 
+  filter(!is.na(position)) %>% 
+  group_by(position) %>% 
+  summarize(n = n()) %>% 
+  ggplot(aes(x = reorder(position, n), y = n)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  labs(x = "Position", y = "Number of Players",
+       title = "What Position do our Athletes Play?") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+subPos <- transData %>% 
+  filter(!is.na(position)) %>% 
+  filter(!is.na(sub_position)) %>% 
+  group_by(position, sub_position) %>% 
+  summarize(n = n()) %>% 
+  ggplot(aes(x = reorder(sub_position, n), y = n)) +
+  geom_col() + 
+  coord_flip() + 
+  facet_wrap(~position, scales = "free_y", ncol = 3) +
+  theme_bw() +
+  labs(x = "Sub-Position", y = "Number of Players",
+       title = "What Position do our Athletes Play?") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_y_continuous(labels = label_number_si()) +
+  theme(text = element_text(size=8))
+
+pos / subPos
+```
+
+The next predictor we will consider is the position that someone plays. The first plot simply allows us to look at the general position that an athlete plays - attack, midfield, defender, or goalkeeper. The most common position for an athlete to play is Attack (`r transData %>% filter(position == "Attack") %>% nrow()`), followed by Defender (`r transData %>% filter(position == "Defender") %>% nrow()`), Midfield (`r transData %>% filter(position == "Midfield") %>% nrow()`), and Goalkeeper (`r transData %>% filter(position == "Goalkeeper") %>% nrow()`). This roughly corresponds to the number of players at each of those positions who are on the field at any given time. The second plot allows us to look at the most common sub-positions within each position. Far and away the most common position is centre-back (`r transData %>% filter(sub_position == "Centre-Back") %>% nrow()`), followed (unsurprisingly) by centre-forward (`r transData %>% filter(sub_position == "Centre-Forward") %>% nrow()`) and central midfield (`r transData %>% filter(sub_position == "Central Midfield") %>% nrow()`). Between the two of these variables, given that they do not have too many different categorical levels, we should be able to use this as an interesting variable in the prediction of market value (as well as a potential interaction with goals, assists, and other variables).
+
+#### On-Field Performance
+
+```{r Goals}
+goals <- ggplot(transData, aes(x = total_goals)) +
+  geom_histogram(color = "white") +
+  theme_bw() +
+  labs(x = "Total Goals", y = "Number of Players", 
+       title = "Goals 18-19") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+goalsTrans <- transData %>% 
+  filter(total_goals > 0) %>% 
+  ggplot(aes(x = total_goals)) +
+  geom_histogram(color = "white") +
+  theme_bw() +
+  labs(x = "Total Number of Goals Scored", y = "Number of Players", 
+       title = "Distribution of Goals Scored during the 2018-2019 Season",
+       subtitle = "excluding players who scored 0 goals") +
+  theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5))
+
+goalsTrans2 <- transData %>% 
+  filter(total_goals > 0) %>% 
+  ggplot(aes(x = log(total_goals))) +
+  geom_histogram(color = "white") +
+  theme_bw() +
+  labs(x = "Log of Total Number of Goals Scored", y = "Number of Players", 
+       title = "Distribution of Goals Scored during the 2018-2019 Season") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+goals2 <- transData %>% 
+  filter(total_goals > 0) %>% 
+  ggplot(aes(x = total_goals)) +
+  geom_histogram(color = "white") +
+  theme_bw() +
+  labs(x = "Total Goals", y = "Number of Players", 
+       title = "Goals 18-19") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+assists <- ggplot(transData, aes(x = total_assists)) + 
+  geom_histogram(color = "white") +
+  theme_bw() +
+  labs(x = "Total Assists", y = "Number of Players", title = "Assists 18-19") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+assists2 <- transData %>% 
+  filter(total_assists > 0) %>% 
+  ggplot(aes(x = total_assists)) + 
+  geom_histogram(color = "white") +
+  theme_bw() +
+  labs(x = "Total Assists", y = "Number of Players", title = "Assists 18-19") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+minutes <- ggplot(transData, aes(x = total_minutes)) +
+  geom_histogram(color = "white") +
+  theme_bw() +
+  labs(x = "Total Minutes", y = "Number of Players", title = "Minutes 18-19") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+minutes2 <- transData %>% 
+  filter(total_minutes > 0) %>% 
+  ggplot(aes(x = total_minutes)) +
+  geom_histogram(color = "white") +
+  theme_bw() +
+  labs(x = "Total Minutes", y = "Number of Players", title = "Minutes 18-19") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+red <- ggplot(transData, aes(x = total_red)) +
+  geom_histogram(color = "white") +
+  theme_bw() +
+  labs(x = "Total Red Cards", y = "Number of Players", title = "Red Cards 18-19") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+(goals2 + assists2) / (minutes2 + red)
+```
+
+```{r On-Field Descriptives, eval = F}
+describe(transData$total_goals, quant = c(.25, .75))
+outliers_mad(transData$total_goals)
+transData %>% 
+  filter(total_goals > 0) %>% 
+  nrow()
+transData %>% 
+  filter(total_goals > 0) %>% 
+  {describe(.$total_goals, quant = c(.25, .75))}
+
+describe(transData$total_assists, quant = c(.25, .75))
+outliers_mad(transData$total_assists)
+transData %>% 
+  filter(total_assists > 0) %>% 
+  nrow()
+transData %>% 
+  filter(total_assists > 0) %>% 
+  {describe(.$total_assists, quant = c(.25, .75))}
+
+describe(transData$total_minutes, quant = c(.25, .75))
+outliers_mad(transData$total_minutes)
+transData %>% 
+  filter(total_minutes > 0) %>% 
+  nrow()
+transData %>% 
+  filter(total_minutes > 0) %>% 
+  {describe(.$total_minutes, quant = c(.25, .75))}
+
+transData %>% 
+  group_by(total_red) %>% 
+  count()
+```
+
+The remaining predictors that we will consider are a player's personal stats. Given that all of these variables are heavily right-skewed and any observations greater than 0 were considered outliers, we elected to present the graphs only when the values were present (i.e., greater than 0); however, we have considered the data both with and without these values. The first plot shows us the total goals scored by players who scored any (removing `r transData %>% filter(total_goals == 0) %>% nrow()` players who did not score a goal), which shows a unimodal but incredibly right-skewed distribution, centered around 2 with a range from 1 to 51. The median is 2 (Q1 = 1, Q3 = 5), with a mean at 3.83 (sd = 4.36). The skew (3.16) and Kurtosi (14.94) values verify that this is still a skewed distribution. The second plot shows us the total assists earned by players (excluding `r transData %>% filter(total_assists == 0) %>% nrow()` players who did not earn any), which shows a unimodal but still right-skewed distribution, again centered around 2 with a range from 1 to 23. The median is 2 (Q1 = 1, Q3 = 4), with a mean at 2.94 (sd = 2.7). The skew (2.39) and Kurtosi (7.92) values reflect that this remains a skewed distribution. The third plot shows us the total minutes played (excluding `r transData %>% filter(total_minutes == 0) %>% nrow()` players who did not play), which shows a unimodal and right-skewed (but less so) distribution, with a mode around 250 and a range from 1 to 4913. The median is 1168.5 (Q1 = 348, Q3 = 2141), with a mean at 1338.91 (sd = 1066.15). The skew (0.55) and Kurtosi (-0.63) values actually suggest that this is a reasonable distribution of data, and that it is not concerningly distributed. The final plot shows us the total number of red cards that players received. This reflects 15,213 players receiving 0 red cards, while 399 received 1, 23 received 2, and only 3 received 3. Given this lack of distribution, we may be better served by considering the total number of yellow cards received by a player instead.
+
+### Numeric Predictor and Response Relationships
+
+```{r corrplot}
+
+transData |>
+  select(total_goals, total_assists, total_minutes, total_yellow, total_red, age_in_days, final_value) %>%
+  cor(.) %>% # we make the correlations, only on complete.obs
+  round(., 2) %>%  # this just rounds up the numbers, we can remove it
+  corrplot::corrplot(., method="number", number.cex = 0.7)
+```
+
+The plot above shows the correlations between our key numeric predictor variables and our response variable of final market value. The most noticeable correlation coefficients are between a player's total minutes played, and their total goals, assists, and yellow cards, producing values of 0.55, 0.64, and 0.78 respectively. These each indicate a moderately strong correlation, which logically makes sense, since a player who plays more minutes would expect to accumulate more stats. Another noticeable value is the moderately strong correlation of 0.67 between a player's total goals and total assists, since these stats are both accumulated more by attacking players and less by defensive players. From this information, it may be interesting to explore the potential interaction effect between a player's position and their total goals and assists, since attackers are expected to have more goals and assists than defenders. Lastly, there does not appear to be strong correlations between total red cards, age, or final market value and any of the other numeric predictors.
+
+### Important Data Transformations
+
+While many of the necessary data transformations have been discussed already, they will be summarized here. We have already transformed our data to consider market value only at the end of the 2018-19 season, accumulated stats across said season, and transformed our data to contain one observation per player. We will need to collapse our categorical variable of nationality into a meaningful number of categories. Additionally, we may well be served by limiting our analysis only to players who actually played in the 2018-19 season, or at least creating some sort of a dummy variable that accounts for this.
+
+## Analysis approach
+
+For this analysis, the response variable is final_value, a player's final market value at the end of the 2018-19 season. Potential predictors include country of birth, country of citizenship, position, sub-position, dominant foot, height, age, and player statistics from the 2018-19 season, such as total goals, assists, minutes, yellow cards, and red cards. We plan to use multiple linear regression to conduct our analysis.
+
+## Data dictionary
+
+The data dictionary can be found [here](https://github.com/sta210-fa22/project-Stats-is-Fun/blob/main/data/README.md).
