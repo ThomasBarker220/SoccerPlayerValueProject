@@ -1,13 +1,7 @@
-# STA 210 final project
-
-This repo will contain all of your project work. Folders and files for relevant pieces of the project will be added as they're assigned in class.
-
-:link: [Instructions](https://sta210-fa22.netlify.app/project-instructions.html)
-
-:link: [Tips + resources](https://sta210-fa22.netlify.app/project-tips.html)
+# Soccer Player Value Project
 
 ## Project Description
-Due to a common interest in soccer, in our project we decided to examine the effect of different predictors on a player's market value. Tens of thousands of soccer players are transferred between clubs each year, and these players often cost clubs millions of dollars and play an integral part in team success. Because of this, the ability to identify undervalued or overvalued players is very desirable for club management. So, we looked at how predictors from the 2018-19 soccer season, such as total goals, total assists, minutes played, yellow cards, player position, nationality, age and height affected a player's market value (at the end of the 2018-19 season).
+Due to a common interest in soccer, we decided to examine the effect of different predictors on a player's market value. Tens of thousands of soccer players are transferred between clubs each year, and these players often cost clubs millions of dollars and play an integral part in team success. Because of this, the ability to identify undervalued or overvalued players is very desirable for club management. So, we looked at how predictors from the 2018-19 soccer season, such as total goals, total assists, minutes played, yellow cards, player position, nationality, age and height affected a player's market value (at the end of the 2018-19 season).
 
 
 ## Football Data From Transfermarkt Data Dictionary
